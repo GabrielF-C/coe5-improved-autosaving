@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from argparse import ArgumentParser, ArgumentTypeError, BooleanOptionalAction
 from hashlib import md5
 from math import ceil
 import os
@@ -14,15 +15,34 @@ from watchdog.events import (
 )
 from watchdog.observers import Observer
 
+
 ####################################################################################################################
 
 
 APPDATA = os.getenv("APPDATA")
-COE5_SAVES_PATH = f"{APPDATA}\\coe5\\saves\\"
+COE5_SAVES_PATH = f"{APPDATA}\\coe5\\saves"
 COE5_AUTOSAVE_NAME = "autosave"
 COE5_PROCESS = "COE5.exe"
 PROCESS_WAIT_TIMEOUT_SECONDS = 120
-AUTOSAVES_TO_KEEP = 3
+AUTOSAVES_TO_KEEP_DEFAULT = 5
+
+####################################################################################################################
+
+
+def max_count(arg):
+  try:
+    max_count = int(arg)
+  except ValueError:
+    raise ArgumentTypeError("Must be an integer")
+  if max_count < 1:
+    raise ArgumentTypeError("Must be more than 0")
+  return max_count
+
+
+ap = ArgumentParser()
+ap.add_argument("-n", "--max-count", type=max_count, default=AUTOSAVES_TO_KEEP_DEFAULT, help="how many autosaves to keep")
+ap.add_argument("--ignore-process", action=BooleanOptionalAction, help=f"if ignore, the program will not check if the '{COE5_PROCESS}' process is running")
+args = ap.parse_args()
 
 
 ####################################################################################################################
@@ -30,7 +50,11 @@ AUTOSAVES_TO_KEEP = 3
 
 class FileIndex:
   @abstractmethod
-  def exists(self, path: str, insert_if_new: bool = True) -> bool:
+  def find(self, path: str) -> tuple[str, str] | tuple[None, str]:
+    pass
+
+  @abstractmethod
+  def insert(self, path: str, file_hash: str):
     pass
 
   @abstractmethod
@@ -47,12 +71,16 @@ class JoinableHandler(RegexMatchingEventHandler):
 class AutosaveIndex(FileIndex):
   FILE_HASH_BUFFER_SIZE = 4000
 
-  def __init__(self, path: str, ignored_filenames: str):
+  def __init__(
+    self,
+    path: str,
+    ignored_filenames: list,
+  ):
     """path: Path to the directory that contains all the autosaves"""
-    self.existing_autosaves = {}
+    self.existing_autosaves: dict[str, str] = {}
     for filename in os.listdir(path):
       if filename not in ignored_filenames:
-        file_path = f"{path}{filename}"
+        file_path = f"{path}\\{filename}"
         file_hash = self.__get_hash_from_file(file_path)
         self.existing_autosaves[file_path] = file_hash
 
@@ -60,18 +88,23 @@ class AutosaveIndex(FileIndex):
     file = open(path, "rb")
     file.seek(ceil(os.stat(path).st_size - self.FILE_HASH_BUFFER_SIZE))
     file_hash = md5(file.read(self.FILE_HASH_BUFFER_SIZE)).hexdigest()
-    print(path, file_hash)
     file.close()
     return file_hash
 
-  def exists(self, path: str, insert_if_new: bool = True) -> bool:
+  def find(self, path: str) -> tuple[str, str] | tuple[None, str]:
     """path: Path to an autosave file"""
     file_hash = self.__get_hash_from_file(path)
-    result = file_hash in self.existing_autosaves.values()
-    if insert_if_new and not result:
-      self.existing_autosaves[path] = file_hash
-    return result
-  
+    for existing_path, existing_hash in self.existing_autosaves.items():
+      if file_hash == existing_hash:
+        return (existing_path, existing_hash)
+    return (None, file_hash)
+
+  def insert(self, path: str, file_hash: str):
+    """path: Path to an autosave file"""
+    if path in self.existing_autosaves.keys():
+      raise KeyError("Key already exists")
+    self.existing_autosaves[path] = file_hash
+
   def remove(self, path: str):
     """path: Path to an autosave file"""
     self.existing_autosaves.pop(path)
@@ -81,7 +114,12 @@ class AutosaveHandler(JoinableHandler):
   HANDLING_DELAY = 2
   """In seconds"""
 
-  def __init__(self, file_name_to_handle: str, autosaves_to_keep: int, index: FileIndex):
+  def __init__(
+    self,
+    file_name_to_handle: str,
+    autosaves_to_keep: int,
+    index: FileIndex,
+  ):
     super().__init__(
       regexes=[f".*\\\\{file_name_to_handle}$"],
       ignore_regexes=[],
@@ -116,35 +154,22 @@ class AutosaveHandler(JoinableHandler):
     self.handling_timer = Timer(self.HANDLING_DELAY, self.__handle_autosave, args=[event])
     self.handling_timer.start()
 
-  def __list_existing_autosaves(self, path: str):
+  def __list_existing_autosaves(self, path: str) -> list[tuple[str, float]]:
     """Returns a list of tuples containing path to each autosave file and its creation time"""
     filtered_paths = [f"{path}\\{filename}" for filename in filter(lambda filename: re.match(f"{self.file_name_to_handle}_.*", filename), os.listdir(path))]
     return [(file_path, os.stat(file_path).st_birthtime) for file_path in filtered_paths]
 
   def __handle_autosave(self, event: FileSystemEvent):
-    """
-    when new autosave is created:
-      if autosave hash is equal to hash of any other save that still exists:
-        print "soft deleting autosave triggered by a reload (same as X)(file kept as '.autosave' until next autosave happens)"
-        replace to .autosave (hides the autosave from the loading menu and prevents it from being overwritten by the game)
-      else:
-        rename to autosave_yyyymmdd_hhmm
-        store hash of .autosave in list
-        while autosave count > N:
-          delete oldest autosave
-          delete hash from list
-    """
     self.handling_barrier.wait()
 
     print("\nHandling ", event)
     dir_name = os.path.dirname(event.src_path)
-    if self.index.exists(event.src_path):
-      print(f"Soft deleting autosave triggered by a reload (file kept as '.{self.file_name_to_handle}' until next reload happens)")
-      os.replace(event.src_path, f"{dir_name}\\.{self.file_name_to_handle}")
-    else:
-      new_autosave = f"{dir_name}\\{self.file_name_to_handle}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-      os.rename(event.src_path, new_autosave)
-      print("New autosave:", new_autosave)
+    matching_autosave = self.index.find(event.src_path)
+    if matching_autosave[0] is None:
+      new_autosave_path = f"{dir_name}\\{self.file_name_to_handle}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+      os.rename(event.src_path, new_autosave_path)
+      self.index.insert(new_autosave_path, matching_autosave[1])
+      print("New autosave:", new_autosave_path)
 
       existing_autosaves = self.__list_existing_autosaves(dir_name)
       while len(existing_autosaves) > self.autosaves_to_keep:
@@ -153,6 +178,10 @@ class AutosaveHandler(JoinableHandler):
         existing_autosaves.remove(oldest_autosave)
         self.index.remove(oldest_autosave[0])
         os.remove(oldest_autosave[0])
+    else:
+      print("Autosave content matches existing save:", matching_autosave[0])
+      print(f"Soft deleting autosave triggered by a load (file kept as '.{self.file_name_to_handle}' until next load happens)")
+      os.replace(event.src_path, f"{dir_name}\\.{self.file_name_to_handle}")
 
 
 class AutosaveWatcher:
@@ -163,17 +192,18 @@ class AutosaveWatcher:
     self,
     path_to_watch: str,
     process_to_wait_for: str,
+    ignore_process: bool,
     process_max_wait_seconds: int,
     handler: JoinableHandler,
   ):
-    self.path = path_to_watch
     self.process = process_to_wait_for.lower()
+    self.ignore_process = ignore_process
     self.process_timeout = process_max_wait_seconds
 
     self.handler = handler
 
     self.observer = Observer()
-    self.observer.schedule(self.handler, self.path)
+    self.observer.schedule(self.handler, path_to_watch)
 
     self.process_exists_call = self.__get_process_exists_call(self.process)
 
@@ -182,6 +212,9 @@ class AutosaveWatcher:
     return ("TASKLIST", "/FI", "imagename eq %s" % process)
 
   def __process_exists(self) -> bool:
+    if self.ignore_process:
+      return True
+
     output = subprocess.check_output(self.process_exists_call).decode(errors="ignore")
     last_line = output.strip().split("\r\n")[-1]
     return last_line.lower().startswith(self.process)
@@ -194,10 +227,7 @@ class AutosaveWatcher:
     print(f"Waiting for process '{self.process}' to start ...")
     while not self.__process_exists():
       diff = max_time_to_wait - datetime.now()
-      print(
-        f"\t{diff.seconds} seconds before timeout",
-        end="",
-      )
+      print(f"\t{diff.seconds} seconds before timeout", end="")
       print("\r", end="")
       time.sleep(1)
       if datetime.now() > max_time_to_wait:
@@ -216,7 +246,8 @@ class AutosaveWatcher:
     except KeyboardInterrupt:
       print("Got a KeyboardInterrupt")
     else:
-      print(f"Process '{self.process}' stopped")
+      if not self.ignore_process:
+        print(f"Process '{self.process}' stopped")
     finally:
       print("Stopping program ...")
       self.observer.stop()
@@ -228,6 +259,6 @@ class AutosaveWatcher:
 
 if __name__ == "__main__":
   index = AutosaveIndex(COE5_SAVES_PATH, [COE5_AUTOSAVE_NAME, f".{COE5_AUTOSAVE_NAME}"])
-  handler = AutosaveHandler(COE5_AUTOSAVE_NAME, AUTOSAVES_TO_KEEP, index)
-  watcher = AutosaveWatcher(COE5_SAVES_PATH, COE5_PROCESS, PROCESS_WAIT_TIMEOUT_SECONDS, handler)
+  handler = AutosaveHandler(COE5_AUTOSAVE_NAME, args.max_count, index)
+  watcher = AutosaveWatcher(COE5_SAVES_PATH, COE5_PROCESS, args.ignore_process, PROCESS_WAIT_TIMEOUT_SECONDS, handler)
   watcher.run()
